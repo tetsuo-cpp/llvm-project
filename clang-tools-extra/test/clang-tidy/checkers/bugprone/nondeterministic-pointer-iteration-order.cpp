@@ -24,19 +24,20 @@ void PointerIteration() {
   for (auto i : OrderedIntSet) // no-warning
     f(i);
 
-  for (auto i : OrderedPtrSet) // no-warning
+  for (auto i : OrderedPtrSet)
     f(i);
+  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
 
   for (auto i : UnorderedIntSet) // no-warning
     f(i);
 
   for (auto i : UnorderedPtrSet)
     f(i);
-  // CHECK-MESSAGES: :[[@LINE-2]]:17: warning: iteration of pointers is nondeterministic
+  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
 
   for (auto &i : UnorderedPtrSet)
     f(i);
-  // CHECK-MESSAGES: :[[@LINE-2]]:18: warning: iteration of pointers is nondeterministic
+  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
 
   for (auto &i : IntMap) // no-warning
     f(i);
@@ -49,7 +50,7 @@ void PointerIteration() {
 
   for (auto &i : PtrUnorderedMap)
     f(i);
-  // CHECK-MESSAGES: :[[@LINE-2]]:18: warning: iteration of pointers is nondeterministic
+  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
 }
 
 bool g (int *x) { return true; }

@@ -1,0 +1,281 @@
+diff --git a/clang-tools-extra/clang-tidy/bugprone/NondeterministicPointerIterationOrderCheck.cpp b/clang-tools-extra/clang-tidy/bugprone/NondeterministicPointerIterationOrderCheck.cpp
+index fdb903a33323..662062bda0aa 100644
+--- a/clang-tools-extra/clang-tidy/bugprone/NondeterministicPointerIterationOrderCheck.cpp
++++ b/clang-tools-extra/clang-tidy/bugprone/NondeterministicPointerIterationOrderCheck.cpp
+@@ -8,13 +8,195 @@
+ 
+ #include "NondeterministicPointerIterationOrderCheck.h"
+ #include "clang/Lex/Lexer.h"
++#include <set>
++#include <string>
++#include <vector>
+ 
+ using namespace clang::ast_matchers;
++using namespace llvm;
+ 
+ namespace clang::tidy::bugprone {
+ 
++namespace {
++
++// ID of a node at which the diagnostic would be emitted.
++constexpr llvm::StringLiteral WarnAtNode = "iter";
++
++// Data structures to capture from the std library and llvm ADTs
++constexpr llvm::StringLiteral UnorderedSetStr = "std::unordered_set";
++constexpr llvm::StringLiteral UnorderedMapStr = "std::unordered_map";
++constexpr llvm::StringLiteral SetStr = "std::set";
++constexpr llvm::StringLiteral MapStr = "std::map";
++constexpr llvm::StringLiteral DenseSetStr = "llvm::DenseSet";
++constexpr llvm::StringLiteral DenseMapStr = "llvm::DenseMap";
++constexpr llvm::StringLiteral SmallPtrSetStr = "llvm::SmallPtrSet";
++// SmallSet with pointers becomes SmallPtrSet, but check in case
++constexpr llvm::StringLiteral SmallSetStr = "llvm::SmallSet";
++constexpr llvm::StringLiteral StringMapStr = "llvm::StringMap";
++constexpr llvm::StringLiteral MultiSetStr = "std::multiset";
++constexpr llvm::StringLiteral MultiMapStr = "std::multimap";
++constexpr llvm::StringLiteral UnorderedMultiSetStr = "std::unordered_multiset";
++constexpr llvm::StringLiteral UnorderedMultiMapStr = "std::unordered_multimap";
++// (esha): May need to add extra LLVM data structures (?)
++// llvm:ValueMap, llvm::IntervalMap, llvm::ImmutableSet / Map
++std::set<llvm::StringLiteral> DataStructureNames = {
++    UnorderedSetStr,     UnorderedMapStr, SetStr,         MapStr,
++    DenseSetStr,         DenseMapStr,     SmallPtrSetStr, SmallSetStr,
++    StringMapStr,        MultiSetStr,     MultiMapStr,    UnorderedMultiSetStr,
++    UnorderedMultiMapStr};
++
++// NOTE: The captures of [a-zA-Z ... \\-] should end with '-' as matchesName
++// will always interpret the final - as a range if there's anything after it
++// (as in a-z or 0-9)
++std::string any = "[a-zA-Z0-9_:-]*";
++std::string anyPointer = "[a-zA-Z0-9_:-]* \\*";
++std::string maybeConst = "( const)?";
++
++// The following MLIR constructs are seen via looking for PointerLikeTypeTraits
++// in their descriptions.
++std::string mlirAnyAttr = "mlir" + any + "Attr";
++std::string mlirAnyOp = "mlir" + any + "Op";
++std::string mlirAnyOpName = "mlir" + any + "OperationName";
++std::string mlirAttribute = "mlir::Attribute";
++std::string mlirBlockArgument = "mlir::BlockArgument";
++std::string mlirLocation = "mlir::Location";
++std::string mlirOpResult = "mlir::OpResult";
++std::string mlirType = "mlir::Type";
++std::string mlirTypeID = "mlir::TypeID";
++std::string mlirValue = "mlir::Value";
++
++/* Note (esha): There are 4 LLVM classes that also use PointerLikeTypeTraits,
++but we don't use it in the monorepo. Therefore, leaving this here in case it
++comes up. {PointerEmbeddedInt, PointerIntPair, PointerUnion, ReachingDef}
++*/
++
++// Must be updated with new pointer pattern strings (from above) if a new
++// pointer class is discovered that is not currently caught, update the list of
++// patterns. (E.g. mlir::Value was previously not caught)
++std::vector<std::string> pointerPatterns = {
++    anyPointer,    mlirAnyAttr,       mlirAnyOp,    mlirAnyOpName,
++    mlirAttribute, mlirBlockArgument, mlirLocation, mlirOpResult,
++    mlirType,      mlirTypeID,        mlirValue};
++
++auto generatePointers(std::vector<std::string> pointerPatterns) {
++  // String we want to match against
++  std::string ptrStrings;
++  // String we do not match against
++  std::string antiPtrStrings;
++
++  // Iterate through all potential pointers and classes.
++  // We specifically catch constructs that are pointers under the hood
++  // such as mlir::Value that the AST cannot break-down into pointers via
++  // the anyPointer string pattern or hasCanonicalType(pointerType()).
++  for (auto pattern : pointerPatterns) {
++    auto ptrPattern = pattern + maybeConst;
++    /* A list of underlying AST iterators for particular data structures
++
++        std::unordered_(multi)*map -> std::__hash_value_type<T1 *, T2>
++    (+) std::unordered_(multi)*set -> std::__hash_node<T *>
++        std::map -> std::__tree_const_iterator<T1 *, T2>
++        std::set -> std::__tree_iterator<T *>
++        llvm::DenseMap -> llvm::DenseSetPair<T1 *, T2>
++        llvm::DenseSet -> llvm::DenseSetPair<T *>
++    (+) llvm::SmallSet == llvm::SmallPtrSet -> SmallPtrSetIterator<T>
++
++    (+): This is required by for-loops with .begin(); .end() ...
++
++    NB: All ptrStrings end with '|' for alternative matching (except the last)
++    */
++    ptrStrings += "_hash" + any + "_node" + any + "<" + ptrPattern + ",|";
++    ptrStrings += "_hash" + any + "_iterator<" + ptrPattern + ",|";
++    ptrStrings += "_map" + any + "_iterator<" + ptrPattern + ",|";
++    ptrStrings += "_[nN]ode" + any + "_iterator<" + ptrPattern + "|";
++    ptrStrings += "_value_type<" + ptrPattern + ",.*> |";
++    ptrStrings += "[pP]air<" + ptrPattern + ",.*>, |";
++    ptrStrings += "[pP]air<" + ptrPattern + ">|";
++    ptrStrings += "_tree" + any + "_iterator<" + ptrPattern + ",.*<|";
++    ptrStrings += "_tree" + any + "_iterator<std::pair<" + ptrPattern + "|";
++    ptrStrings += "_Rb_tree" + any + "_iterator<" + ptrPattern + "|";
++    ptrStrings += "_Rb_tree" + any + "_iterator<std::pair<" + ptrPattern + "|";
++    ptrStrings += "_Node" + any + "_iterator<" + ptrPattern + "|";
++    ptrStrings += "_Node" + any + "_iterator<std::pair<" + ptrPattern + "|";
++
++    // There are some string variants that we do not want to match against.
++    // This should be folded into generatePointers, however, due to the lack of
++    // lookahead/lookbehind support
++    //  (https://stackoverflow.com/a/29190001/3224664)
++    //  (https://discourse.llvm.org/t/clang-tidy-negative-lookahead-support/39007)
++    // we have to resort to use unless() in the return statement of this
++    // function for the anti patterns
++    antiPtrStrings += ", (std::)?[pP]air<" + ptrPattern + ",.*>, |";
++    antiPtrStrings += ", (std::)?[pP]air<" + ptrPattern + ">|";
++  }
++
++  // Flag all instances of SmallPtrSet & StringMap, any use implies the key is
++  // a pointer (StringMap uses const char *)
++  ptrStrings += "SmallPtrSetIterator<" + any + "( \\*)?" + maybeConst + ">|";
++  ptrStrings += "StringMapIter";
++
++  // Note (esha): Very hacky way to remove last '|'
++  if (antiPtrStrings.length() && antiPtrStrings.back() == '|')
++    antiPtrStrings.pop_back();
++
++  return declRefExpr(to(
++      namedDecl(matchesName(ptrStrings), unless(matchesName(antiPtrStrings)))));
++}
++
++auto PointerTypeM = generatePointers(pointerPatterns);
++
++// Assumption: Iteration of ordered containers of pointers is deterministic
++// if the container's insertion order is the same as the traversal order.
++
++// TODO: Currently, we do not check what the for-loop does with the iterated
++// pointer values. Not all iterations may cause non-determinism. For example,
++// counting or summing up the elements should not be non-deterministic.
++auto matchUnorderedIterWithPointers(llvm::StringRef name) -> decltype(decl()) {
++  auto CxxForPointerM = varDecl(hasType(hasCanonicalType(pointerType())));
++
++  auto ContainerM = expr(hasType(hasCanonicalType(hasDeclaration(cxxRecordDecl(
++                             isSameOrDerivedFrom(hasName(name)))))))
++                        .bind("container");
++  auto PointerIterM =
++      stmt(anyOf(cxxForRangeStmt(hasLoopVariable(CxxForPointerM),
++                                 hasRangeInit(ContainerM)),
++                 forStmt(hasDescendant(PointerTypeM), hasDescendant(ContainerM),
++                         unless(hasIncrement(
++                             unaryOperator(hasAnyOperatorName("++", "--")))))))
++          .bind(WarnAtNode);
++
++  return decl(forEachDescendant(PointerIterM));
++}
++
++auto matchUnorderedIterWithNestedPointers(llvm::StringRef name)
++    -> decltype(decl()) {
++  auto CxxForPointerM = varDecl(hasDescendant(
++      cxxOperatorCallExpr(hasOperatorName("*"), hasDescendant(PointerTypeM))));
++
++  auto ContainerM = expr(hasType(hasCanonicalType(
++      hasDeclaration(cxxRecordDecl(isSameOrDerivedFrom(hasName(name)))))));
++
++  auto PointerIterM =
++      stmt(anyOf(cxxForRangeStmt(hasLoopVariable(CxxForPointerM),
++                                 hasRangeInit(ContainerM)),
++                 forStmt(hasDescendant(PointerTypeM), hasDescendant(ContainerM),
++                         unless(hasIncrement(
++                             unaryOperator(hasAnyOperatorName("++", "--")))))))
++          .bind(WarnAtNode);
++
++  return decl(forEachDescendant(PointerIterM));
++}
++
++} // namespace
++
+ void NondeterministicPointerIterationOrderCheck::registerMatchers(
+     MatchFinder *Finder) {
++  for (auto &name : DataStructureNames) {
++    auto MatcherM = matchUnorderedIterWithPointers(name);
++    Finder->addMatcher(traverse(TK_AsIs, MatcherM), this);
++    auto NestedMatcherM = matchUnorderedIterWithNestedPointers(name);
++    Finder->addMatcher(traverse(TK_AsIs, NestedMatcherM), this);
++  }
++
+   auto LoopVariable = varDecl(hasType(
+       qualType(hasCanonicalType(anyOf(referenceType(), pointerType())))));
+ 
+@@ -45,11 +227,21 @@ void NondeterministicPointerIterationOrderCheck::registerMatchers(
+ 
+ void NondeterministicPointerIterationOrderCheck::check(
+     const MatchFinder::MatchResult &Result) {
++  const auto *PointerIteration = Result.Nodes.getNodeAs<Stmt>(WarnAtNode);
++
++  if (PointerIteration && !PointerIteration->getBeginLoc().isMacroID()) {
++    const SourceRange R = PointerIteration->getSourceRange();
++    diag(R.getBegin(),
++         "Pointer-iteration can be non-deterministic (If you're sure this is "
++         "safe, please use #ifndef __clang_analyzer__ to remove this warning).")
++        << R;
++    return;
++  }
++
+   const auto *ForRangePointers =
+       Result.Nodes.getNodeAs<CXXForRangeStmt>("cxxForRangeStmt");
+ 
+-  if ((ForRangePointers) && !(ForRangePointers->getBeginLoc().isMacroID())) {
+-    const auto *RangeInit = Result.Nodes.getNodeAs<Stmt>("rangeinit");
++  if (ForRangePointers && !ForRangePointers->getBeginLoc().isMacroID()) {
+     if (const auto *ClassTemplate =
+             Result.Nodes.getNodeAs<ClassTemplateSpecializationDecl>(
+                 "recorddecl")) {
+@@ -59,12 +251,17 @@ void NondeterministicPointerIterationOrderCheck::check(
+           TemplateArgs[0].getAsType()->isPointerType();
+ 
+       if (IsAlgoArgPointer) {
+-        const SourceRange R = RangeInit->getSourceRange();
+-        diag(R.getBegin(), "iteration of pointers is nondeterministic") << R;
++        const SourceRange R = ForRangePointers->getSourceRange();
++        diag(R.getBegin(),
++             "Pointer-iteration can be non-deterministic (If you're sure this "
++             "is safe, please use #ifndef __clang_analyzer__ to remove this "
++             "warning).")
++            << R;
+       }
+     }
+     return;
+   }
++
+   const auto *SortPointers = Result.Nodes.getNodeAs<Stmt>("sortsemantic");
+ 
+   if ((SortPointers) && !(SortPointers->getBeginLoc().isMacroID())) {
+diff --git a/clang-tools-extra/test/clang-tidy/checkers/bugprone/nondeterministic-pointer-iteration-order.cpp b/clang-tools-extra/test/clang-tidy/checkers/bugprone/nondeterministic-pointer-iteration-order.cpp
+index 91853874d0af..0355058a6b3b 100644
+--- a/clang-tools-extra/test/clang-tidy/checkers/bugprone/nondeterministic-pointer-iteration-order.cpp
++++ b/clang-tools-extra/test/clang-tidy/checkers/bugprone/nondeterministic-pointer-iteration-order.cpp
+@@ -24,19 +24,20 @@ void PointerIteration() {
+   for (auto i : OrderedIntSet) // no-warning
+     f(i);
+ 
+-  for (auto i : OrderedPtrSet) // no-warning
++  for (auto i : OrderedPtrSet)
+     f(i);
++  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
+ 
+   for (auto i : UnorderedIntSet) // no-warning
+     f(i);
+ 
+   for (auto i : UnorderedPtrSet)
+     f(i);
+-  // CHECK-MESSAGES: :[[@LINE-2]]:17: warning: iteration of pointers is nondeterministic
++  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
+ 
+   for (auto &i : UnorderedPtrSet)
+     f(i);
+-  // CHECK-MESSAGES: :[[@LINE-2]]:18: warning: iteration of pointers is nondeterministic
++  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
+ 
+   for (auto &i : IntMap) // no-warning
+     f(i);
+@@ -49,7 +50,7 @@ void PointerIteration() {
+ 
+   for (auto &i : PtrUnorderedMap)
+     f(i);
+-  // CHECK-MESSAGES: :[[@LINE-2]]:18: warning: iteration of pointers is nondeterministic
++  // CHECK-MESSAGES: :[[@LINE-2]]:3: warning: Pointer-iteration can be non-deterministic
+ }
+ 
+ bool g (int *x) { return true; }
